@@ -37,6 +37,41 @@ class Formulation(enum.Enum):
     NORMAL_FOURIER: str = vector.NORMAL_FOURIER
     POL_FOURIER: str = vector.POL_FOURIER
 
+def conv_permittivity_matrices(
+    primitive_lattice_vectors: basis.LatticeVectors,
+    permittivity: jnp.ndarray,
+    expansion: basis.Expansion,
+    formulation: Formulation | VectorFn,
+) -> Tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    Optional[Tuple[jnp.ndarray, jnp.ndarray]],
+]:
+    """Returns matrices derived from permittivity for isotropic media."""
+    if permittivity.shape[-2:] == (1, 1):
+        return _uniform_isotropic_permittivity_matrices(
+            permittivity=permittivity,
+            expansion=expansion,
+        )
+
+    if not utils.batch_compatible_shapes(
+        primitive_lattice_vectors.u.shape[:-1],
+        primitive_lattice_vectors.v.shape[:-1],
+        permittivity.shape[:-2],
+    ):
+        raise ValueError(
+            f"`primitive_lattice_vectors` and `permittivity` must be batch-compatible, "
+            f"but got shapes {primitive_lattice_vectors.u.shape}, "
+            f"{primitive_lattice_vectors.v.shape}, and {permittivity.shape}."
+        )
+
+    return _patterned_isotropic_permittivity_matrices(
+        primitive_lattice_vectors=primitive_lattice_vectors,
+        permittivity=permittivity,
+        expansion=expansion,
+        formulation=formulation,
+    )
 
 def eigensolve_isotropic_media(
     wavelength: jnp.ndarray,
@@ -78,6 +113,74 @@ def eigensolve_isotropic_media(
         primitive_lattice_vectors=primitive_lattice_vectors,
         permittivity=permittivity,
         expansion=expansion,
+    )
+
+
+def eigensolve_isotropic_media_from_conv_matrices(
+    wavelength: jnp.ndarray,
+    in_plane_wavevector: jnp.ndarray,
+    primitive_lattice_vectors: basis.LatticeVectors,
+    expansion: basis.Expansion,
+    inverse_z_permittivity_matrix: jnp.ndarray,
+    z_permittivity_matrix: jnp.ndarray,
+    transverse_permittivity_matrix: jnp.ndarray,
+    tangent_vector_field: Optional[Tuple[jnp.ndarray, jnp.ndarray]],
+    is_uniform: bool,
+) -> "LayerSolveResult":
+    """Performs isotropic eigensolve from precomputed convolution matrices.
+
+    Args:
+        wavelength: The free space wavelength of the excitation.
+        in_plane_wavevector: `(kx0, ky0)`.
+        primitive_lattice_vectors: The primitive vectors for the real-space lattice.
+        expansion: The field expansion to be used.
+        inverse_z_permittivity_matrix: The inverse z-permittivity convolution matrix.
+        z_permittivity_matrix: The z-permittivity convolution matrix.
+        transverse_permittivity_matrix: The transverse permittivity matrix.
+        tangent_vector_field: Tangent vector field `(tx, ty)` for vector formulations,
+            or `None` for `FFT`.
+        is_uniform: Whether the layer is uniform (`True`) or patterned (`False`).
+
+    Returns:
+        The `LayerSolveResult`.
+    """
+    # Match broadcasting behavior of permittivity-based APIs so lattice vectors,
+    # wavelength, and in-plane wavevector are batch-compatible with matrix inputs.
+    matrix_batch_shape = z_permittivity_matrix.shape[:-2]
+    permittivity_stub = jnp.ones(matrix_batch_shape + (1, 1), dtype=z_permittivity_matrix.dtype)
+    (
+        wavelength,
+        in_plane_wavevector,
+        primitive_lattice_vectors,
+        _,
+    ) = _validate_and_broadcast(
+        wavelength,
+        in_plane_wavevector,
+        primitive_lattice_vectors,
+        permittivity_stub,
+    )
+
+    if is_uniform:
+        return _eigensolve_uniform_isotropic_media_from_permittivity_matrices(
+            wavelength=wavelength,
+            in_plane_wavevector=in_plane_wavevector,
+            primitive_lattice_vectors=primitive_lattice_vectors,
+            expansion=expansion,
+            inverse_z_permittivity_matrix=inverse_z_permittivity_matrix,
+            z_permittivity_matrix=z_permittivity_matrix,
+            transverse_permittivity_matrix=transverse_permittivity_matrix,
+            tangent_vector_field=tangent_vector_field,
+        )
+
+    return _eigensolve_patterned_isotropic_media_from_permittivity_matrices(
+        wavelength=wavelength,
+        in_plane_wavevector=in_plane_wavevector,
+        primitive_lattice_vectors=primitive_lattice_vectors,
+        expansion=expansion,
+        inverse_z_permittivity_matrix=inverse_z_permittivity_matrix,
+        z_permittivity_matrix=z_permittivity_matrix,
+        transverse_permittivity_matrix=transverse_permittivity_matrix,
+        tangent_vector_field=tangent_vector_field,
     )
 
 
@@ -411,12 +514,89 @@ def _eigensolve_uniform_isotropic_media(
             f"of {permittivity.shape}."
         )
 
-    batch_shape = jnp.broadcast_shapes(
-        wavelength.shape, in_plane_wavevector.shape[:-1], permittivity.shape[:-2]
+    (
+        inverse_z_permittivity_matrix,
+        z_permittivity_matrix,
+        transverse_permittivity_matrix,
+        tangent_vector_field,
+    ) = _uniform_isotropic_permittivity_matrices(
+        permittivity=permittivity,
+        expansion=expansion,
     )
 
+    return _eigensolve_uniform_isotropic_media_from_permittivity_matrices(
+        wavelength=wavelength,
+        in_plane_wavevector=in_plane_wavevector,
+        primitive_lattice_vectors=primitive_lattice_vectors,
+        expansion=expansion,
+        inverse_z_permittivity_matrix=inverse_z_permittivity_matrix,
+        z_permittivity_matrix=z_permittivity_matrix,
+        transverse_permittivity_matrix=transverse_permittivity_matrix,
+        tangent_vector_field=tangent_vector_field,
+    )
+
+
+def _uniform_isotropic_permittivity_matrices(
+    permittivity: jnp.ndarray,
+    expansion: basis.Expansion,
+) -> Tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    Optional[Tuple[jnp.ndarray, jnp.ndarray]],
+]:
+    """Returns matrices derived from permittivity for uniform isotropic media."""
+    batch_shape = permittivity.shape[:-2]
+    permittivity_scalar = jnp.squeeze(permittivity, axis=(-2, -1))
+    inverse_z_permittivity_matrix = jnp.broadcast_to(
+        1 / permittivity_scalar[..., jnp.newaxis],
+        batch_shape + (expansion.num_terms,),
+    )
+    inverse_z_permittivity_matrix = utils.diag(inverse_z_permittivity_matrix)
+    z_permittivity_matrix = jnp.broadcast_to(
+        permittivity_scalar[..., jnp.newaxis],
+        batch_shape + (expansion.num_terms,),
+    )
+    z_permittivity_matrix = utils.diag(z_permittivity_matrix)
+    zeros = jnp.zeros(
+        batch_shape + (expansion.num_terms,),
+        dtype=z_permittivity_matrix.dtype,
+    )
+    transverse_permittivity_matrix = jnp.block(
+        [
+            [z_permittivity_matrix, utils.diag(zeros)],
+            [utils.diag(zeros), z_permittivity_matrix],
+        ]
+    )
+    tangent_vector_field = None
+    return (
+        inverse_z_permittivity_matrix,
+        z_permittivity_matrix,
+        transverse_permittivity_matrix,
+        tangent_vector_field,
+    )
+
+
+def _eigensolve_uniform_isotropic_media_from_permittivity_matrices(
+    wavelength: jnp.ndarray,
+    in_plane_wavevector: jnp.ndarray,
+    primitive_lattice_vectors: basis.LatticeVectors,
+    expansion: basis.Expansion,
+    inverse_z_permittivity_matrix: jnp.ndarray,
+    z_permittivity_matrix: jnp.ndarray,
+    transverse_permittivity_matrix: jnp.ndarray,
+    tangent_vector_field: Optional[Tuple[jnp.ndarray, jnp.ndarray]],
+) -> LayerSolveResult:
+    """Returns a uniform isotropic layer eigensolve from permittivity matrices."""
+    del transverse_permittivity_matrix, tangent_vector_field
+
     num_eigenvalues = 2 * expansion.num_terms
-    permittivity = jnp.squeeze(permittivity, axis=(-2, -1))
+    permittivity = z_permittivity_matrix[..., 0, 0]
+    batch_shape = jnp.broadcast_shapes(
+        wavelength.shape,
+        in_plane_wavevector.shape[:-1],
+        permittivity.shape,
+    )
 
     # Transverse wavevectors are the `k + G` from equation 5 of [2012 Liu].
     transverse_wavevectors = basis.transverse_wavevectors(
@@ -444,15 +624,6 @@ def _eigensolve_uniform_isotropic_media(
     eigenvalues = _select_eigenvalues_sign(eigenvalues)
     eigenvalues = jnp.tile(eigenvalues, 2)
 
-    batch_shape = eigenvalues.shape[:-1]
-    inverse_z_permittivity_matrix = jnp.broadcast_to(
-        1 / permittivity[..., jnp.newaxis], batch_shape + (expansion.num_terms,)
-    )
-    inverse_z_permittivity_matrix = utils.diag(inverse_z_permittivity_matrix)
-    z_permittivity_matrix = jnp.broadcast_to(
-        permittivity[..., jnp.newaxis], batch_shape + (expansion.num_terms,)
-    )
-    z_permittivity_matrix = utils.diag(z_permittivity_matrix)
     z_permeability_matrix = utils.diag(
         jnp.ones(
             z_permittivity_matrix.shape[:-1],
@@ -513,12 +684,56 @@ def _eigensolve_patterned_isotropic_media(
         z_permittivity_matrix,
         transverse_permittivity_matrix,
         tangent_vector_field,
-    ) = fourier_matrices_patterned_isotropic_media(
+    ) = _patterned_isotropic_permittivity_matrices(
         primitive_lattice_vectors=primitive_lattice_vectors,
         permittivity=permittivity,
         expansion=expansion,
         formulation=formulation,
     )
+
+    return _eigensolve_patterned_isotropic_media_from_permittivity_matrices(
+        wavelength=wavelength,
+        in_plane_wavevector=in_plane_wavevector,
+        primitive_lattice_vectors=primitive_lattice_vectors,
+        expansion=expansion,
+        inverse_z_permittivity_matrix=inverse_z_permittivity_matrix,
+        z_permittivity_matrix=z_permittivity_matrix,
+        transverse_permittivity_matrix=transverse_permittivity_matrix,
+        tangent_vector_field=tangent_vector_field,
+    )
+
+
+def _patterned_isotropic_permittivity_matrices(
+    primitive_lattice_vectors: basis.LatticeVectors,
+    permittivity: jnp.ndarray,
+    expansion: basis.Expansion,
+    formulation: Formulation | VectorFn,
+) -> Tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    Optional[Tuple[jnp.ndarray, jnp.ndarray]],
+]:
+    """Returns matrices derived from permittivity for patterned isotropic media."""
+    return fourier_matrices_patterned_isotropic_media(
+        primitive_lattice_vectors=primitive_lattice_vectors,
+        permittivity=permittivity,
+        expansion=expansion,
+        formulation=formulation,
+    )
+
+
+def _eigensolve_patterned_isotropic_media_from_permittivity_matrices(
+    wavelength: jnp.ndarray,
+    in_plane_wavevector: jnp.ndarray,
+    primitive_lattice_vectors: basis.LatticeVectors,
+    expansion: basis.Expansion,
+    inverse_z_permittivity_matrix: jnp.ndarray,
+    z_permittivity_matrix: jnp.ndarray,
+    transverse_permittivity_matrix: jnp.ndarray,
+    tangent_vector_field: Optional[Tuple[jnp.ndarray, jnp.ndarray]],
+) -> LayerSolveResult:
+    """Returns a patterned isotropic layer eigensolve from permittivity matrices."""
 
     # Create permeability matrices for nonmagnetic materials.
     ones = jnp.ones(
