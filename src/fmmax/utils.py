@@ -3,6 +3,8 @@
 Copyright (c) Meta Platforms, Inc. and affiliates.
 """
 
+import logging
+import os
 from typing import Tuple
 
 import jax
@@ -14,14 +16,39 @@ import jax.numpy as jnp
 # pure-jax implementation of the eigendecomposition.
 try:
     import jeig
+    import jeig.jeig as jeig_impl
 
     _JEIG_AVAILABLE = True
+    _JEIG_BACKEND = "torch"
+
+    _backend_override = os.environ.get("FMMAX_JEIG_BACKEND", "auto").lower()
+    if _backend_override != "auto":
+        jeig.set_backend(_backend_override)
+        _JEIG_BACKEND = _backend_override
+    else:
+        if jax.devices()[0].platform == "gpu":
+            supports_cusolver = bool(getattr(jeig_impl, "_SUPPORTS_CUSOLVER", False))
+            supports_magma = bool(getattr(jeig_impl, "_SUPPORTS_MAGMA", False))
+            if supports_cusolver:
+                jeig.set_backend("cusolver")
+                _JEIG_BACKEND = "cusolver"
+            elif supports_magma:
+                jeig.set_backend("magma")
+                _JEIG_BACKEND = "magma"
+            else:
+                jeig.set_backend("torch")
+                _JEIG_BACKEND = "torch"
+        else:
+            jeig.set_backend("torch")
+            _JEIG_BACKEND = "torch"
 except ModuleNotFoundError:
     _JEIG_AVAILABLE = False
+    _JEIG_BACKEND = "jax"
 
 
 EIG_EPS_RELATIVE = 1e-12
 EIG_EPS_MINIMUM = 1e-24
+_EIG_BACKEND_LOGGED = False
 
 
 def diag(x: jnp.ndarray) -> jnp.ndarray:
@@ -150,7 +177,9 @@ def _eig_jax(matrix: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
                 jnp.ones(matrix.shape, dtype=dtype),  # Eigenvectors
             ),
             matrix.astype(dtype),
-            vectorized=True,
+            # vectorized=True,
+            vmap_method="legacy_vectorized",
+            # vmap_method="sequential",
         )
 
 
@@ -160,6 +189,18 @@ with jax.default_device(jax.devices("cpu")[0]):
 
 def _eig(matrix: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Eigendecomposition using `jeig` if available, and `_eig_jax` if not."""
+    global _EIG_BACKEND_LOGGED
+    if not _EIG_BACKEND_LOGGED:
+        if _JEIG_AVAILABLE:
+            logging.getLogger(__name__).info(
+                "Eigen backend: jeig (%s)", _JEIG_BACKEND
+            )
+        else:
+            logging.getLogger(__name__).info(
+                "Eigen backend: jax pure_callback -> CPU jnp.linalg.eig"
+            )
+        _EIG_BACKEND_LOGGED = True
+
     if _JEIG_AVAILABLE:
         return jeig.eig(matrix)
     else:
