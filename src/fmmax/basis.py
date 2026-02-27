@@ -81,12 +81,20 @@ class Truncation(enum.Enum):
 
     CIRCULAR: str = "circular"
     PARALLELOGRAMIC: str = "parallelogramic"
+    ANNULUS: str = "annulus"
+    CUSTOM: str = "custom"
+    TOPM: str = "topM"
 
 
 def generate_expansion(
     primitive_lattice_vectors: LatticeVectors,
     approximate_num_terms: int,
     truncation: Truncation,
+    factor: float | None = None,
+    kmin_abs: float | None = None,
+    keep_zero_order: bool = True,
+    custom_basis_coefficients: onp.ndarray | None = None,
+    mask: jnp.ndarray | None = None,
 ) -> Expansion:
     """Generates the expansion for the specified real-space basis.
 
@@ -95,11 +103,18 @@ def generate_expansion(
         approximate_num_terms: The approximate number of terms in the expansion. To
             maintain a symmetric expansion, the total number of terms may differ from
             this value.
-        truncation: The truncation to be used for the expansion.
+        truncation: The Truncation object to be used for the expansion: "CIRCULAR", "PARALLELOGRAMIC", "ANNULUS", "CUSTOM", or "TOPM".
+        factor: For ANNULUS truncation, the inner radius factor (0-1). For TOPM truncation, the factor to multiply `approximate_num_terms` to get `N`. Ignored for other modes.
+        kmin_abs: For ANNULUS truncation, the absolute inner radius. Ignored for other modes.
+        keep_zero_order: For ANNULUS truncation, whether to include the zero-order term. Ignored for other modes.
+        custom_basis_coefficients: For CUSTOM truncation, an integer-valued array
+            with shape `(num_terms, 2)` containing the basis coefficients. Ignored
+            for other modes.
 
     Returns:
         The `Expansion`. The basis coefficients of the expansion are sorted so that
-        the zeroth-order term is first.
+        the zeroth-order term is first (for circular and parallelogramic) or by magnitude 
+        with zero-order first (for annulus).
     """
     reciprocal_vectors = primitive_lattice_vectors.reciprocal
     if truncation == Truncation.CIRCULAR:
@@ -110,6 +125,22 @@ def generate_expansion(
         basis_coefficients = _basis_coefficients_parallelogramic(
             reciprocal_vectors, approximate_num_terms
         )
+    elif truncation == Truncation.ANNULUS:
+        basis_coefficients = _basis_coefficients_annulus(
+            reciprocal_vectors,
+            approximate_num_terms,
+            factor=factor,
+            kmin_abs=kmin_abs,
+            keep_zero_order=keep_zero_order,
+        )
+    elif truncation == Truncation.CUSTOM:
+        basis_coefficients = _basis_coefficients_custom(custom_basis_coefficients)
+    elif truncation == Truncation.TOPM:
+        basis_coefficients = _basis_coefficients_topM(
+            primitive_lattice_vectors=reciprocal_vectors,
+            M=approximate_num_terms,
+            x=mask,
+        )  
     else:
         raise ValueError(f"Unknown `truncation`, got {truncation}.")
     return Expansion(basis_coefficients)
@@ -393,6 +424,162 @@ def _cross_product(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
     return x[..., 0] * y[..., 1] - x[..., 1] * y[..., 0]
 
 
+def _basis_coefficients_custom(
+    custom_basis_coefficients: onp.ndarray | None,
+) -> onp.ndarray:
+    """Validates and returns user-provided custom basis coefficients."""
+    if custom_basis_coefficients is None:
+        raise ValueError(
+            "`custom_basis_coefficients` must be provided for CUSTOM truncation."
+        )
+
+    coeffs = onp.asarray(custom_basis_coefficients)
+    if coeffs.ndim != 2 or coeffs.shape[-1] != 2 or coeffs.shape[0] == 0:
+        raise ValueError(
+            "`custom_basis_coefficients` must have shape `(num_terms>0, 2)` but got "
+            f"{coeffs.shape}."
+        )
+    if not onp.issubdtype(coeffs.dtype, onp.integer):
+        raise ValueError(
+            "`custom_basis_coefficients` must have an integer dtype, but got "
+            f"{coeffs.dtype}."
+        )
+
+
+    _, unique_indices = onp.unique(coeffs, axis=0, return_index=True)
+    if len(unique_indices) != len(coeffs):
+        raise ValueError("`custom_basis_coefficients` contains duplicate rows.")
+    unique_coeffs = coeffs[onp.sort(unique_indices)]
+
+    zero_mask = onp.all(unique_coeffs == onp.array([0, 0]), axis=1)
+    if onp.any(zero_mask):
+        unique_coeffs = onp.vstack([unique_coeffs[zero_mask], unique_coeffs[~zero_mask]])
+
+    return unique_coeffs
+
+def _basis_coefficients_topM(
+    primitive_lattice_vectors: LatticeVectors,
+    M: int,
+    x: jnp.ndarray,
+    axes: Tuple[int, int] = (-2, -1),
+) -> onp.ndarray:
+    if x is None:
+        raise ValueError("`x` must be provided for TOPM truncation.")
+    axes: Tuple[int, int] = utils.absolute_axes(axes, x.ndim)  
+    x_fft = jnp.fft.fft2(x, axes=axes, norm="forward")
+    leading_dims = len(x.shape[: axes[0]])
+    trailing_dims = len(x.shape[axes[1] + 1 :])
+
+    candidate_coeffs = _basis_coefficients_parallelogramic(primitive_lattice_vectors=primitive_lattice_vectors,
+                                                           approximate_num_terms=x.shape[axes[0]] * x.shape[axes[1]])
+    
+    
+    
+    slices = (
+        [slice(None)] * leading_dims
+        + [candidate_coeffs[:, 0], candidate_coeffs[:, 1]]
+        + [slice(None)] * trailing_dims
+    )
+    
+    x_fft = x_fft[tuple(slices)]
+
+    magnitude = onp.abs(x_fft)
+    order = onp.argsort(-magnitude)
+    sorted_coeffs = candidate_coeffs[..., order, :]
+    return sorted_coeffs[..., :M, :]
+
+def _basis_coefficients_annulus(
+    primitive_lattice_vectors: LatticeVectors,
+    approximate_num_terms: int,
+    kmin_factor: float | None = None,
+    kmin_abs: float | None = None,
+    keep_zero_order: bool = True,
+) -> onp.ndarray:
+    """Computes the basis coefficients of lattice vectors lying within an annulus.
+
+    The coefficients generate a set of lattice vectors from a basis using an annular
+    truncation, so that all lattice vectors lying within an annular region with area
+    given by `num * u ⨉ v` are included, where `⨉` is the cross product. The size of
+    the set will generally be close to `approximate_num_terms`.
+
+    Args:
+        primitive_lattice_vectors: Primitive vectors for the reciprocal-space lattice.
+        approximate_num_terms: The approximate number of terms in the expansion. To
+            maintain a symmetric expansion, the total number of terms may differ from
+            this value.
+        kmin_factor: The inner radius of the annulus is given by `kmin_factor` times the
+            outer radius. Must be between 0 and 1. Outer radius is determined by `approximate_num_terms` as described above.
+        kmin_abs: The inner radius of the annulus is at least `kmin_abs`. Must be non-negative.
+        keep_zero_order: Whether to include the zero-order term (i.e. the term with zero coefficients) in the expansion, even if it lies outside the annulus.
+
+
+    Returns:
+        The coefficients, with shape `(num_vectors, 2)`. The final axis gives the
+        coefficient for the first and second vector in the basis.
+    """
+    
+    if kmin_factor is not None and (kmin_factor < 0 or kmin_factor > 1):
+        raise ValueError(f"`kmin_factor` must be between 0 and 1, but got {kmin_factor}.")
+    if kmin_abs is not None and kmin_abs < 0:
+        raise ValueError(f"`kmin_abs` must be non-negative, but got {kmin_abs}.")
+    if kmin_factor is not None and kmin_abs is not None:
+        raise ValueError("Cannot specify both `kmin_factor` and `kmin_abs`.")
+    
+    if kmin_factor is None and kmin_abs is None:
+        return _basis_coefficients_circular(primitive_lattice_vectors, approximate_num_terms)
+
+    FBZ_area = onp.abs(
+        _cross_product(primitive_lattice_vectors.u, primitive_lattice_vectors.v)
+    )
+    if kmin_factor is not None:
+        if kmin_factor == 0:
+            return _basis_coefficients_circular(primitive_lattice_vectors, approximate_num_terms)
+        max_magnitude = onp.sqrt(
+            approximate_num_terms
+            * FBZ_area / onp.pi / (1 - kmin_factor**2)
+        )
+        min_magnitude = kmin_factor * max_magnitude
+    else:  # kmin_abs is not None
+        min_magnitude = kmin_abs
+        max_magnitude = onp.sqrt(
+            approximate_num_terms
+            * FBZ_area
+            / onp.pi + min_magnitude**2
+        )
+    
+    # Generate candidate coefficients. These will include more coefficients than needed;
+    # subsequently we will filter based on magnitude.
+    Nmin = int(onp.ceil(onp.pi *min_magnitude**2 / FBZ_area))
+    Nmax = Nmin + approximate_num_terms 
+    exp_max = _basis_coefficients_circular(primitive_lattice_vectors, Nmax)
+    exp_min = _basis_coefficients_circular(primitive_lattice_vectors, Nmin)
+    
+    # Find rows in exp_max that are not in exp_min
+    exp_min_set = set(map(tuple, exp_min))
+    mask = onp.array([tuple(row) not in exp_min_set for row in exp_max])
+    exp = exp_max[mask]
+
+    if keep_zero_order and not onp.any(onp.all(exp == onp.array([0, 0]), axis=1)):
+        exp = onp.vstack([exp, onp.array([[0, 0]])])
+
+    vectors = (
+        exp[..., 0, onp.newaxis] * primitive_lattice_vectors.u[..., onp.newaxis, :]
+        + exp[..., 1, onp.newaxis] * primitive_lattice_vectors.v[..., onp.newaxis, :]
+    )
+    magnitude = onp.linalg.norm(vectors, axis=-1)
+    order = onp.argsort(magnitude)
+    exp = exp[..., order, :]
+
+    if keep_zero_order:
+        zero_mask = onp.all(exp == onp.array([0, 0]), axis=1)
+        if onp.any(zero_mask):
+            exp = onp.vstack([exp[zero_mask], exp[~zero_mask]])
+
+    return exp
+
+
+
+            
 # -----------------------------------------------------------------------------
 # Register custom objects in this module with jax to enable `jit`.
 # -----------------------------------------------------------------------------

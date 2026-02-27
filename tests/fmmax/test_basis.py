@@ -18,6 +18,60 @@ def _coeffs_set(coeffs):
 
 
 class ExpansionTest(unittest.TestCase):
+    def test_custom_uses_provided_coefficients(self):
+        primitive_lattice_vectors = basis.LatticeVectors(
+            u=jnp.array([1.0, 0.0]), v=jnp.array([0.0, 1.0])
+        )
+        custom_coeffs = onp.array([[2, -1], [0, 0], [-3, 4], [2, -1]], dtype=onp.int64)
+        expansion = basis.generate_expansion(
+            primitive_lattice_vectors=primitive_lattice_vectors,
+            approximate_num_terms=999,
+            truncation=basis.Truncation.CUSTOM,
+            custom_basis_coefficients=custom_coeffs,
+        )
+        expected_coeffs = onp.array([[0, 0], [2, -1], [-3, 4]], dtype=onp.int64)
+        onp.testing.assert_array_equal(expansion.basis_coefficients, expected_coeffs)
+
+    def test_custom_requires_coefficients(self):
+        primitive_lattice_vectors = basis.LatticeVectors(
+            u=jnp.array([1.0, 0.0]), v=jnp.array([0.0, 1.0])
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "`custom_basis_coefficients` must be provided for CUSTOM truncation",
+        ):
+            basis.generate_expansion(
+                primitive_lattice_vectors=primitive_lattice_vectors,
+                approximate_num_terms=20,
+                truncation=basis.Truncation.CUSTOM,
+            )
+
+    def test_custom_validates_shape_and_dtype(self):
+        primitive_lattice_vectors = basis.LatticeVectors(
+            u=jnp.array([1.0, 0.0]), v=jnp.array([0.0, 1.0])
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "`custom_basis_coefficients` must have shape",
+        ):
+            basis.generate_expansion(
+                primitive_lattice_vectors=primitive_lattice_vectors,
+                approximate_num_terms=20,
+                truncation=basis.Truncation.CUSTOM,
+                custom_basis_coefficients=onp.array([0, 1, 2], dtype=onp.int64),
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "`custom_basis_coefficients` must have an integer dtype",
+        ):
+            basis.generate_expansion(
+                primitive_lattice_vectors=primitive_lattice_vectors,
+                approximate_num_terms=20,
+                truncation=basis.Truncation.CUSTOM,
+                custom_basis_coefficients=onp.array([[0.0, 1.0]], dtype=onp.float32),
+            )
+
     def test_circular_with_square_lattice(self):
         primitive_lattice_vectors = basis.LatticeVectors(
             u=jnp.array([1.0, 0.0]), v=jnp.array([0.0, 1.0])
