@@ -71,7 +71,7 @@ def fft(
     Returns:
         The transformed `x`.
     """
-    axes: Tuple[int, int] = utils.absolute_axes(axes, x.ndim)  # type: ignore[no-redef]
+    axes = utils.absolute_axes(axes, x.ndim) 
     _validate_shape_for_expansion(tuple([x.shape[ax] for ax in axes]), expansion)
 
     x_fft = jnp.fft.fft2(x, axes=axes, norm="forward")

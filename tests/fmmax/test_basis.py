@@ -72,6 +72,46 @@ class ExpansionTest(unittest.TestCase):
                 custom_basis_coefficients=onp.array([[0.0, 1.0]], dtype=onp.float32),
             )
 
+    def test_annulus_factor_dispatches_without_keyword_error(self):
+        primitive_lattice_vectors = basis.LatticeVectors(
+            u=jnp.array([1.0, 0.0]), v=jnp.array([0.0, 1.0])
+        )
+        expansion = basis.generate_expansion(
+            primitive_lattice_vectors=primitive_lattice_vectors,
+            approximate_num_terms=20,
+            truncation=basis.Truncation.ANNULUS,
+            factor=0.5,
+        )
+        self.assertGreater(expansion.num_terms, 0)
+
+    def test_topm_factor_selects_fraction_of_terms(self):
+        primitive_lattice_vectors = basis.LatticeVectors(
+            u=jnp.array([1.0, 0.0]), v=jnp.array([0.0, 1.0])
+        )
+        mask = jnp.ones((8, 8), dtype=jnp.float32)
+        expansion = basis.generate_expansion(
+            primitive_lattice_vectors=primitive_lattice_vectors,
+            approximate_num_terms=5,
+            truncation=basis.Truncation.TOPM,
+            factor=0.6,
+            mask=mask,
+        )
+        self.assertGreaterEqual(expansion.num_terms, 3)
+
+    def test_topm_factor_must_be_in_valid_range(self):
+        primitive_lattice_vectors = basis.LatticeVectors(
+            u=jnp.array([1.0, 0.0]), v=jnp.array([0.0, 1.0])
+        )
+        mask = jnp.ones((8, 8), dtype=jnp.float32)
+        with self.assertRaisesRegex(ValueError, "`factor` must be in the range"):
+            basis.generate_expansion(
+                primitive_lattice_vectors=primitive_lattice_vectors,
+                approximate_num_terms=5,
+                truncation=basis.Truncation.TOPM,
+                factor=0.0,
+                mask=mask,
+            )
+
     def test_circular_with_square_lattice(self):
         primitive_lattice_vectors = basis.LatticeVectors(
             u=jnp.array([1.0, 0.0]), v=jnp.array([0.0, 1.0])

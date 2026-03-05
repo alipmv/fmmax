@@ -79,11 +79,11 @@ class Expansion:
 class Truncation(enum.Enum):
     """Enumerates truncation modes."""
 
-    CIRCULAR: str = "circular"
-    PARALLELOGRAMIC: str = "parallelogramic"
-    ANNULUS: str = "annulus"
-    CUSTOM: str = "custom"
-    TOPM: str = "topM"
+    CIRCULAR = "circular"
+    PARALLELOGRAMIC = "parallelogramic"
+    ANNULUS = "annulus"
+    CUSTOM = "custom"
+    TOPM = "topM"
 
 
 def generate_expansion(
@@ -104,7 +104,10 @@ def generate_expansion(
             maintain a symmetric expansion, the total number of terms may differ from
             this value.
         truncation: The Truncation object to be used for the expansion: "CIRCULAR", "PARALLELOGRAMIC", "ANNULUS", "CUSTOM", or "TOPM".
-        factor: For ANNULUS truncation, the inner radius factor (0-1). For TOPM truncation, the factor to multiply `approximate_num_terms` to get `N`. Ignored for other modes.
+        factor: For ANNULUS truncation, the inner radius factor (0-1). For TOPM
+            truncation, the fraction of terms to select via TOPM. Must be in
+            `(0, 1]`. The remaining terms are filled from circular truncation.
+            If `None`, all terms are selected via TOPM.
         kmin_abs: For ANNULUS truncation, the absolute inner radius. Ignored for other modes.
         keep_zero_order: For ANNULUS truncation, whether to include the zero-order term. Ignored for other modes.
         custom_basis_coefficients: For CUSTOM truncation, an integer-valued array
@@ -116,6 +119,10 @@ def generate_expansion(
         the zeroth-order term is first (for circular and parallelogramic) or by magnitude 
         with zero-order first (for annulus).
     """
+    if approximate_num_terms <= 0:
+        raise ValueError(
+            f"`approximate_num_terms` must be positive, but got {approximate_num_terms}."
+        )
     reciprocal_vectors = primitive_lattice_vectors.reciprocal
     if truncation == Truncation.CIRCULAR:
         basis_coefficients = _basis_coefficients_circular(
@@ -129,18 +136,51 @@ def generate_expansion(
         basis_coefficients = _basis_coefficients_annulus(
             reciprocal_vectors,
             approximate_num_terms,
-            factor=factor,
+            kmin_factor=factor,
             kmin_abs=kmin_abs,
             keep_zero_order=keep_zero_order,
         )
     elif truncation == Truncation.CUSTOM:
         basis_coefficients = _basis_coefficients_custom(custom_basis_coefficients)
     elif truncation == Truncation.TOPM:
-        basis_coefficients = _basis_coefficients_topM(
+        if mask is None:
+            raise ValueError("`mask` must be provided for TOPM truncation.")
+        if factor is None:
+            top_m = approximate_num_terms
+        else:
+            if factor <= 0 or factor > 1:
+                raise ValueError(
+                    "`factor` must be in the range (0, 1] for TOPM truncation, "
+                    f"but got {factor}."
+                )
+            top_m = max(1, int(onp.floor(factor * approximate_num_terms)))
+
+        topm_coefficients = _basis_coefficients_topM(
             primitive_lattice_vectors=reciprocal_vectors,
-            M=approximate_num_terms,
-            x=mask,
-        )  
+            M=top_m,
+            mask=mask,
+        )
+
+        if topm_coefficients.shape[0] >= approximate_num_terms:
+            basis_coefficients = topm_coefficients[:approximate_num_terms]
+        else:
+            remaining = approximate_num_terms - topm_coefficients.shape[0]
+            circular_coefficients = _basis_coefficients_circular(
+                primitive_lattice_vectors=reciprocal_vectors,
+                approximate_num_terms=max(remaining * 2, remaining),
+            )
+
+            topm_set = {tuple(row) for row in topm_coefficients}
+            circular_unique = onp.asarray(
+                [row for row in circular_coefficients if tuple(row) not in topm_set],
+                dtype=topm_coefficients.dtype,
+            )
+            if circular_unique.size == 0:
+                basis_coefficients = topm_coefficients
+            else:
+                basis_coefficients = onp.vstack(
+                    [topm_coefficients, circular_unique[:remaining]]
+                )
     else:
         raise ValueError(f"Unknown `truncation`, got {truncation}.")
     return Expansion(basis_coefficients)
@@ -460,33 +500,46 @@ def _basis_coefficients_custom(
 def _basis_coefficients_topM(
     primitive_lattice_vectors: LatticeVectors,
     M: int,
-    x: jnp.ndarray,
+    mask: jnp.ndarray,
     axes: Tuple[int, int] = (-2, -1),
 ) -> onp.ndarray:
-    if x is None:
-        raise ValueError("`x` must be provided for TOPM truncation.")
-    axes: Tuple[int, int] = utils.absolute_axes(axes, x.ndim)  
-    x_fft = jnp.fft.fft2(x, axes=axes, norm="forward")
-    leading_dims = len(x.shape[: axes[0]])
-    trailing_dims = len(x.shape[axes[1] + 1 :])
+    """Selects the top-`M` reciprocal coefficients by Fourier magnitude from `x`."""
+    if mask is None:
+        raise ValueError("`mask` must be provided for TOPM truncation.")
+    if M <= 0:
+        raise ValueError(f"`M` must be positive for TOPM truncation, but got {M}.")
 
-    candidate_coeffs = _basis_coefficients_parallelogramic(primitive_lattice_vectors=primitive_lattice_vectors,
-                                                           approximate_num_terms=x.shape[axes[0]] * x.shape[axes[1]])
-    
-    
-    
+    axes = utils.absolute_axes(axes, mask.ndim) # type: ignore
+    x_fft = jnp.fft.fft2(mask, axes=axes, norm="forward")
+    leading_dims = len(mask.shape[: axes[0]])
+    trailing_dims = len(mask.shape[axes[1] + 1 :])
+
+    candidate_coeffs = _basis_coefficients_parallelogramic(
+        primitive_lattice_vectors=primitive_lattice_vectors,
+        approximate_num_terms=mask.shape[axes[0]] * mask.shape[axes[1]],
+    )
+
     slices = (
         [slice(None)] * leading_dims
         + [candidate_coeffs[:, 0], candidate_coeffs[:, 1]]
         + [slice(None)] * trailing_dims
     )
-    
-    x_fft = x_fft[tuple(slices)]
 
-    magnitude = onp.abs(x_fft)
+    selected_fft = x_fft[tuple(slices)]
+    # magnitude = onp.asarray(jnp.abs(selected_fft)).reshape(
+    #     candidate_coeffs.shape[0], -1
+    # )
+    # scores = magnitude.mean(axis=1)
+    # order = onp.argsort(-scores)
+    # sorted_coeffs = candidate_coeffs[order]
+
+    magnitude = onp.abs(selected_fft)
     order = onp.argsort(-magnitude)
     sorted_coeffs = candidate_coeffs[..., order, :]
     return sorted_coeffs[..., :M, :]
+
+
+    return sorted_coeffs[:M]
 
 def _basis_coefficients_annulus(
     primitive_lattice_vectors: LatticeVectors,
